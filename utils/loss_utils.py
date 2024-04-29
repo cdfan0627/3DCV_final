@@ -74,3 +74,35 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
+    
+def compute_depth_loss(dyn_depth, gt_depth):
+
+    t_d = torch.median(dyn_depth)
+    s_d = torch.mean(torch.abs(dyn_depth - t_d))
+    dyn_depth_norm = (dyn_depth - t_d) / s_d
+
+    t_gt = torch.median(gt_depth)
+    s_gt = torch.mean(torch.abs(gt_depth - t_gt))
+    gt_depth_norm = (gt_depth - t_gt) / s_gt
+
+    return torch.mean((dyn_depth_norm - gt_depth_norm) ** 2)
+
+def mean_angular_error(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Compute the mean angular error between predicted and reference normals
+
+    Args:
+        pred: [C, H, W] tensor of predicted normals
+        gt: [C, H, W] tensor of ground truth normals
+
+    Returns:
+        mae: [H, W] mean angular error
+    """
+    # Dot product between gt and pred over the C dimension
+    dot_products = torch.sum(gt * pred, dim=0)  # sum over the C dimension now
+    # Clamp the dot product to ensure valid cosine values (to avoid NaNs)
+    dot_products = torch.clamp(dot_products, -1.0, 1.0)
+    # Calculate the angle between the vectors (in radians)
+    mae = torch.acos(dot_products)
+    return mae
+
+

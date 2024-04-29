@@ -100,7 +100,7 @@ class DeformNetwork(nn.Module):
             self.gaussian_warp = nn.Linear(W, 3)
         self.gaussian_rotation = nn.Linear(W, 4)
         self.gaussian_scaling = nn.Linear(W, 3)
-        self.gaussian_vector = nn.Linear(W, 10)
+        #self.gaussian_normal = nn.Linear(W, 3)
 
     def forward(self, x, t):
         t_emb = self.embed_time_fn(t)
@@ -126,12 +126,12 @@ class DeformNetwork(nn.Module):
             d_xyz = self.gaussian_warp(h)
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)
-        vector = self.gaussian_vector(h)
+        #delta_normal = self.gaussian_normal(h)
 
-        return d_xyz, rotation, scaling, vector
+        return d_xyz, rotation, scaling
 
 class SpecNetwork(nn.Module):
-    def __init__(self, input_size=14, hidden_size=64, output_size=3):
+    def __init__(self, input_size=13, hidden_size=64, output_size=3):
         super(SpecNetwork, self).__init__()
         self.hidden1 = nn.Linear(input_size, hidden_size)
         self.hidden2 = nn.Linear(hidden_size, hidden_size)
@@ -140,8 +140,8 @@ class SpecNetwork(nn.Module):
         self.sigmoid = nn.Sigmoid()
         print("Hellow")
 
-    def forward(self, vector, view, rough):
-        spec_color = torch.cat([vector, view, rough], dim=-1)
+    def forward(self, vector, view):
+        spec_color = torch.cat([vector, view], dim=-1)
         spec_color1 = self.relu(self.hidden1(spec_color))
         spec_color2 = self.relu(self.hidden2(spec_color1))
         spec_color3 = self.sigmoid(self.output(spec_color2))

@@ -30,7 +30,7 @@ def quaternion_multiply(q1, q2):
     return torch.stack((w, x, y, z), dim=-1)
 
 
-def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling,  spec_color, iteration, is_6dof=False, 
+def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling,  spec_color, normal, iteration, is_6dof=False, 
            scaling_modifier=1.0, override_color=None):
     """
     Render the scene. 
@@ -88,8 +88,7 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
         scales = pc.get_scaling + d_scaling
         rotations = pc.get_rotation + d_rotation
 
-    dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1))
-    dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True) # (N, 3)
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
@@ -105,15 +104,19 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
             else:
                 shs = pc.get_features
         else:
-            diffuse   = pc.get_diffuse # (N, 3) 
+            #diffuse   = pc.get_diffuse # (N, 3) 
             specular  = pc.get_specular # (N, 3) 
-            diffuse_linear = torch.sigmoid(diffuse - np.log(3.0))
-            colors_precomp = diffuse_linear + torch.mul(specular, spec_color)
+            #diffuse_linear = torch.sigmoid(diffuse - np.log(3.0))
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
+            diffuse = eval_sh(0, shs_view, dirs = None)
+            diffuse_linear = torch.sigmoid(diffuse)
+            specular_color = torch.mul(specular, spec_color)
+            colors_precomp = diffuse_linear + specular_color
     else:
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii, rendered_depth, rendered_alpha, proj_means_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -122,11 +125,45 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
         scales=scales,
         rotations=rotations,
         cov3D_precomp=cov3D_precomp)
+    render_extras = {}
+    out_extras = {}
+    
+    if iteration >= opt.warm_up2:
+        normal_normed = 0.5*normal + 0.5
+        render_extras.update({"normal": normal_normed,
+                            "diffuse": diffuse_linear,
+                            "specular_color": specular_color,
+                            })
+        
+        for k in render_extras.keys():
+                if render_extras[k] is None: continue
+                image = rasterizer(
+                    means3D = means3D,
+                    means2D = means2D,
+                    shs = None,
+                    colors_precomp = render_extras[k],
+                    opacities = opacity,
+                    scales = scales,
+                    rotations = rotations,
+                    cov3D_precomp = cov3D_precomp)[0]
+                out_extras[k] = image
+        # for k in["normal"]:
+        #         if k in out_extras.keys():
+        #             out_extras[k] = (out_extras[k] - 0.5) * 2.
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
+    out = {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter": radii > 0,
             "radii": radii,
-            "depth": depth}
+            "depth": rendered_depth,
+            "alpha": rendered_alpha,
+            "proj_2D": proj_means_2D,
+            "conic_2D": conic_2D,
+            "conic_2D_inv": conic_2D_inv,
+            "gs_per_pixel": gs_per_pixel,
+            "weight_per_gs_pixel": weight_per_gs_pixel,
+            "x_mu": x_mu}
+    out.update(out_extras)
+    return out

@@ -55,8 +55,8 @@ class SpecModel:
         self.optimizer = None
 
 
-    def step(self, vector, view, rough):
-        return self.specdecoder(vector, view, rough)
+    def step(self, vector, view):
+        return self.specdecoder(vector, view)
 
     def train_setting(self, training_args):
         l = [

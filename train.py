@@ -12,16 +12,19 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence
+from utils.loss_utils import l1_loss, ssim, kl_divergence, compute_depth_loss, mean_angular_error
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel, SpecModel
-from utils.general_utils import safe_state, get_linear_noise_func, safe_normalize, reflect
+from utils.general_utils import safe_state, get_linear_noise_func, safe_normalize, reflect,  rotation_matrix_from_vectors
+from utils.rigid_utils import from_homogenous, to_homogenous
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import numpy as np
+import copy
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -31,28 +34,38 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+    torch.autograd.set_detect_anomaly(True)
+
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
     specdecoder = SpecModel()
     deform.train_setting(opt)
     specdecoder.train_setting(opt)
-
+    
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    white_color = [1, 1, 1]
+    white_background = torch.tensor(white_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    ema_flow_loss_for_log = 0.0
     best_psnr = 0.0
     best_iteration = 0
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
+    if scene.use_loader:
+        cam_loader = torch.utils.data.DataLoader(scene.getTrainCameras(), batch_size=1, shuffle=True, collate_fn=list)
+        loader = iter(cam_loader)
+        viewpoint_cam = next(loader)[0]
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
     for iteration in range(1, opt.iterations + 1):
         if network_gui.conn == None:
@@ -73,21 +86,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         iter_start.record()
 
+        
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
+        if scene.use_loader:
+            try:
+                viewpoint_cam2 = next(loader)[0]
+            except:
+                loader = iter(cam_loader)
+                viewpoint_cam = next(loader)[0]
+                viewpoint_cam2 = next(loader)[0]
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-        total_frame = len(viewpoint_stack)
+        total_frame = len(scene.getTrainCameras())
         time_interval = 1 / total_frame
-
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        
+        if iteration >= opt.warm_up:
+            decay_iteration = total_frame
+            Temp = 1. / (10 ** ((iteration - 3000) // (decay_iteration * 1000)))
+        else:
+            Temp = 0
+        
         if dataset.load2gpu_on_the_fly:
+            if viewpoint_cam2 is not None:
+                viewpoint_cam2.load2device()
             viewpoint_cam.load2device()
+
+        if viewpoint_cam2 is not None:
+            fid2 = viewpoint_cam2.fid
         fid = viewpoint_cam.fid
+        
 
         if iteration < opt.warm_up:
             gaussians.set_requires_grad("features_dc", state=True)
@@ -95,60 +129,123 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             gaussians.set_requires_grad("diffuse_color", state=False)
             gaussians.set_requires_grad("roughness", state=False)
             gaussians.set_requires_grad("specular", state=False)
-            d_xyz, d_rotation, d_scaling, d_vector, spec_color = 0.0, 0.0, 0.0, 0.0, 0.0
+            gaussians.set_requires_grad("normal", state=False)
+            d_xyz, d_rotation, d_scaling, spec_color, new_normal = 0.0, 0.0, 0.0, 0.0, 0.0
         elif iteration < opt.warm_up2:
             gaussians.set_requires_grad("features_dc", state=True)
             gaussians.set_requires_grad("features_rest", state=True)
             gaussians.set_requires_grad("diffuse_color", state=False)
             gaussians.set_requires_grad("roughness", state=False)
             gaussians.set_requires_grad("specular", state=False)
+            gaussians.set_requires_grad("normal", state=False)
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
-
-            ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
-            d_xyz, d_rotation, d_scaling, d_vector = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
-            spec_color = 0.0
+            
+            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input)
+            if viewpoint_cam2 is not None:
+                time_input2 = fid2.unsqueeze(0).expand(N, -1)
+                d_xyz2, d_rotation2, d_scaling2 = deform.step(gaussians.get_xyz.detach(), time_input2)
+            
+            spec_color, new_normal = 0.0, 0.0
+            
         else:
-            gaussians.set_requires_grad("features_dc", state=False)
+            gaussians.set_requires_grad("features_dc", state=True)
             gaussians.set_requires_grad("features_rest", state=False)
-            gaussians.set_requires_grad("diffuse_color", state=True)
+            gaussians.set_requires_grad("diffuse_color", state=False)
             gaussians.set_requires_grad("roughness", state=True)
             gaussians.set_requires_grad("specular", state=True)
+            gaussians.set_requires_grad("normal", state=True)
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
-            d_xyz, d_rotation, d_scaling, d_vector  = deform.step(gaussians.get_xyz.detach(), time_input)
+            d_xyz, d_rotation, d_scaling  = deform.step(gaussians.get_xyz.detach(), time_input)
+            if viewpoint_cam2 is not None:
+                time_input2 = fid2.unsqueeze(0).expand(N, -1)
+                d_xyz2, d_rotation2, d_scaling2 = deform.step(gaussians.get_xyz.detach(), time_input2)
             view_pos = viewpoint_cam.camera_center.repeat(gaussians.get_opacity.shape[0], 1)
-            gb_pos = gaussians.get_xyz.detach()
-            wo = safe_normalize(view_pos - gb_pos)
-            dir_pp = (gaussians.get_xyz.detach() - viewpoint_cam.camera_center.repeat(gaussians.get_opacity.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-            normal = gaussians.get_normal(dir_pp_normalized=dir_pp_normalized).detach()
-            reflvec = safe_normalize(reflect(wo, normal))
-            spec_color = specdecoder.step(d_vector, reflvec, gaussians.get_roughness.detach())
+            wo = safe_normalize(view_pos - gaussians.get_xyz.detach())
+            dir_pp_normalized = -wo
+            normal = gaussians.get_normal(dir_pp_normalized=dir_pp_normalized)
+            deform_wo = safe_normalize(view_pos - (gaussians.get_xyz.detach() + d_xyz.detach()))
+            deform_dir_pp_normalized = -deform_wo
+            deform_normal = gaussians.get_deformnormal(d_rotation, d_scaling, dir_pp_normalized=deform_dir_pp_normalized)
+            rotation_matrix = rotation_matrix_from_vectors(normal, deform_normal)
+            deform_deltanormal = torch.matmul(rotation_matrix, gaussians.get_delta_normal.unsqueeze(-1))
+            new_normal = safe_normalize(deform_normal + deform_deltanormal.squeeze(-1))
+            reflvec = safe_normalize(reflect(deform_wo, new_normal))
+            spat = torch.cat([gaussians.get_xyz.detach() + d_xyz.detach(), gaussians.get_roughness * (gaussians.get_scaling.detach() + d_scaling.detach()), gaussians.get_rotation.detach() + d_rotation.detach()], dim=-1)
+            spec_color = specdecoder.step(spat, reflvec)
+            
             
 
         # Render
-        render_pkg_re = render(viewpoint_cam, gaussians, opt, pipe, background, d_xyz, d_rotation, d_scaling, spec_color, iteration, dataset.is_6dof)
+        render_pkg_re = render(viewpoint_cam, gaussians, opt, pipe, background, d_xyz, d_rotation, d_scaling, spec_color, new_normal, iteration, dataset.is_6dof)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
-        # depth = render_pkg_re["depth"]
+        #depth = render_pkg_re["depth"]
+        Lflow = 0
+        #depth_loss = 0
+        
+        if iteration >= opt.warm_up and viewpoint_cam.kwargs['fwd_flow'] is not None:
+            # Gaussian flow
+            render_t_1 = render(viewpoint_cam, gaussians, opt, pipe, background, d_xyz, d_rotation, d_scaling, spec_color, new_normal, iteration, dataset.is_6dof)
+            render_t_2 = render(viewpoint_cam, gaussians, opt, pipe, background, d_xyz2, d_rotation2, d_scaling2, spec_color, new_normal, iteration, dataset.is_6dof)
+                # Gaussian parameters at t_1
+            proj_2D_t_1 = render_t_1["proj_2D"]
+            gs_per_pixel = render_t_1["gs_per_pixel"].long() 
+            weight_per_gs_pixel = render_t_1["weight_per_gs_pixel"]
+            x_mu = render_t_1["x_mu"]
+            cov2D_inv_t_1 = render_t_1["conic_2D"].detach()
+                # Gaussian parameters at t_2
+            proj_2D_t_2 = render_t_2["proj_2D"]
+            cov2D_inv_t_2 = render_t_2["conic_2D"]
+            cov2D_t_2 = render_t_2["conic_2D_inv"]
+                # calculate cov2D_t_2*cov2D_inv_t_1
+            cov2D_t_2cov2D_inv_t_1 = torch.zeros([cov2D_inv_t_2.shape[0],2,2]).cuda()
+            cov2D_t_2cov2D_inv_t_1[:, 0, 0] = cov2D_t_2[:, 0] * cov2D_inv_t_1[:, 0] + cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 1]
+            cov2D_t_2cov2D_inv_t_1[:, 0, 1] = cov2D_t_2[:, 0] * cov2D_inv_t_1[:, 1] + cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 2]
+            cov2D_t_2cov2D_inv_t_1[:, 1, 0] = cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 0] + cov2D_t_2[:, 2] * cov2D_inv_t_1[:, 1]
+            cov2D_t_2cov2D_inv_t_1[:, 1, 1] = cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 1] + cov2D_t_2[:, 2] * cov2D_inv_t_1[:, 2]
 
+                # full formulation of GaussianFlow
+            cov_multi = (cov2D_t_2cov2D_inv_t_1[gs_per_pixel] @ x_mu.permute(0,2,3,1).unsqueeze(-1).detach()).squeeze()
+
+            predicted_flow_by_gs = (cov_multi + proj_2D_t_2[gs_per_pixel] - proj_2D_t_1[gs_per_pixel].detach() - x_mu.permute(0,2,3,1).detach()) * weight_per_gs_pixel.unsqueeze(-1).detach()
+            optical_flow = viewpoint_cam.kwargs['fwd_flow'].cuda()
+            #large_motion_msk = torch.norm(optical_flow, p=2, dim=-1) >= 0.1
+            Lflow = torch.norm((optical_flow - predicted_flow_by_gs.sum(0)), p=2, dim=-1).mean()
+            #depth_loss = compute_depth_loss(depth, viewpoint_cam.kwargs['depth_map'].permute(2, 0, 1).to('cuda')) 
+        
         # Loss
+        if iteration < opt.warm_up2:
+            normal_loss, reg_loss = 0.0, 0.0
+        else:
+            reg_loss = torch.sum(torch.norm(gaussians.get_delta_normal, p=2, dim=1))
+            pred_normal = render_pkg_re["normal"].to('cuda')
+            #pred_normal = pred_normal / torch.norm(pred_normal, p=2, dim=0, keepdim=True)
+            gt_normal = viewpoint_cam.kwargs['normal_map'].permute(2, 0, 1).to('cuda')
+            #gt_normal = gt_normal / torch.norm(gt_normal, p=2, dim=0, keepdim=True)
+            normal_loss = torch.abs((gt_normal - pred_normal)).mean()
+            #normal_loss = mean_angular_error(pred=(pred_normal.permute(2, 0, 1) - 1) / 2, gt=(gt_normal.permute(2, 0, 1) - 1) / 2).mean()
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))+ (opt.lambda_normal * normal_loss) +(opt.lambda_reg * reg_loss)
+        loss += opt.lambda_flow * Lflow
         loss.backward()
 
+        viewpoint_cam = viewpoint_cam2
         iter_end.record()
 
+        '''
         if dataset.load2gpu_on_the_fly:
             viewpoint_cam.load2device('cpu')
-
+        '''
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # fl = Lflow.item() if hasattr(Lflow, 'item') else Lflow
+            # ema_flow_loss_for_log = 0.4 * fl + 0.6 * ema_flow_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{Ll1:.{4}f}", "Flow loss": f"{Lflow:.{4}f}", "normal loss": f"{normal_loss:.{4}f}", "reg loss": f"{reg_loss:.{4}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -156,7 +253,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # Keep track of max radii in image-space for pruning
             gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
                                                                  radii[visibility_filter])
-
+  
+                
             # Log and save
             cur_psnr = training_report(tb_writer, iteration, opt, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
                                        testing_iterations, scene, render, (pipe, background), deform, specdecoder,
@@ -241,6 +339,7 @@ def training_report(tb_writer, iteration, opt, Ll1, loss, l1_loss, elapsed, test
                                            range(5, 30, 5)]})
 
         for config in validation_configs:
+
             if config['cameras'] and len(config['cameras']) > 0:
                 images = torch.tensor([], device="cuda")
                 gts = torch.tensor([], device="cuda")
@@ -248,19 +347,33 @@ def training_report(tb_writer, iteration, opt, Ll1, loss, l1_loss, elapsed, test
                     if load2gpu_on_the_fly:
                         viewpoint.load2device()
                     fid = viewpoint.fid
-                    xyz = scene.gaussians.get_xyz
-                    time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-                    d_xyz, d_rotation, d_scaling, d_vector = deform.step(xyz.detach(), time_input)
-                    view_pos = viewpoint.camera_center.repeat(scene.gaussians.get_opacity.shape[0], 1)
-                    gb_pos = scene.gaussians.get_xyz.detach()
-                    wo = safe_normalize(view_pos - gb_pos)
-                    dir_pp = (scene.gaussians.get_xyz.detach() - viewpoint.camera_center.repeat(scene.gaussians.get_opacity.shape[0], 1))
-                    dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-                    normal = scene.gaussians.get_normal(dir_pp_normalized=dir_pp_normalized).detach()
-                    reflvec = safe_normalize(reflect(wo, normal))
-                    spec_color = specdecoder.step(d_vector, reflvec, scene.gaussians.get_roughness.detach())
+                    
+                    if iteration < opt.warm_up:
+                        d_xyz, d_rotation, d_scaling, spec_color, new_normal = 0.0, 0.0, 0.0, 0.0, 0.0
+                    elif iteration < opt.warm_up2:
+                        xyz = scene.gaussians.get_xyz
+                        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+                        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+                        spec_color, new_normal = 0.0, 0.0
+                    else:
+                        xyz = scene.gaussians.get_xyz
+                        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+                        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+                        view_pos = viewpoint.camera_center.repeat(scene.gaussians.get_opacity.shape[0], 1)
+                        wo = safe_normalize(view_pos - scene.gaussians.get_xyz.detach())
+                        dir_pp_normalized = -wo
+                        normal = scene.gaussians.get_normal(dir_pp_normalized=dir_pp_normalized)
+                        deform_wo = safe_normalize(view_pos - (scene.gaussians.get_xyz.detach() + d_xyz.detach()))
+                        deform_dir_pp_normalized = -deform_wo
+                        deform_normal = scene.gaussians.get_deformnormal(d_rotation, d_scaling, dir_pp_normalized=deform_dir_pp_normalized)
+                        rotation_matrix = rotation_matrix_from_vectors(normal, deform_normal)
+                        deform_deltanormal = torch.matmul(rotation_matrix, scene.gaussians.get_delta_normal.unsqueeze(-1))
+                        new_normal = safe_normalize(deform_normal + deform_deltanormal.squeeze(-1))
+                        reflvec = safe_normalize(reflect(deform_wo, new_normal))
+                        spat = torch.cat([scene.gaussians.get_xyz.detach() + d_xyz.detach(), scene.gaussians.get_roughness * (scene.gaussians.get_scaling.detach() + d_scaling.detach()), scene.gaussians.get_rotation.detach() + d_rotation.detach()], dim=-1)
+                        spec_color = specdecoder.step(spat, reflvec)
                     image = torch.clamp(
-                        renderFunc(viewpoint, scene.gaussians, opt, *renderArgs, d_xyz, d_rotation, d_scaling,  spec_color, iteration, is_6dof)["render"],
+                        renderFunc(viewpoint, scene.gaussians, opt, *renderArgs, d_xyz, d_rotation, d_scaling,  spec_color, new_normal, iteration, is_6dof)["render"],
                         0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     images = torch.cat((images, image.unsqueeze(0)), dim=0)
@@ -268,9 +381,13 @@ def training_report(tb_writer, iteration, opt, Ll1, loss, l1_loss, elapsed, test
 
                     if load2gpu_on_the_fly:
                         viewpoint.load2device('cpu')
-                    if tb_writer and (idx < 5):
+                    if tb_writer and (idx < 100):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
                                              image[None], global_step=iteration)
+                        if iteration >= opt.warm_up2:
+                            normal_image = renderFunc(viewpoint, scene.gaussians, opt, *renderArgs, d_xyz, d_rotation, d_scaling, spec_color, new_normal, iteration, is_6dof)["normal"]
+                            tb_writer.add_images(config['name'] + "_view_{}/normal".format(viewpoint.image_name),
+                                                normal_image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
@@ -291,9 +408,10 @@ def training_report(tb_writer, iteration, opt, Ll1, loss, l1_loss, elapsed, test
 
     return test_psnr
 
-
 if __name__ == "__main__":
     # Set up command line argument parser
+    torch.manual_seed(6000)
+    np.random.seed(6000)
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -302,8 +420,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=list(range(11000, 40001, 1000)))
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[20_000, 30_000, 40000])
+                        default=list(range(12000, 40001, 1000)))
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=list(range(18000, 40001, 1000)))
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

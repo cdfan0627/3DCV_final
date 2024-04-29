@@ -11,13 +11,93 @@
 
 import os
 import random
+import torch
 import json
+import numpy as np
+from PIL import Image
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from scene.deform_model import DeformModel, SpecModel
 from arguments import ModelParams
+from scene.cameras import Camera
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, cams, args):
+        self.cams = cams
+        self.args = args
+
+    def __getitem__(self, index):
+        cam_info = self.cams[index]
+        # image = cam_info.image
+        image = Image.open(cam_info.image_path)
+        resized_image = torch.from_numpy(np.array(image)) / 255.0
+
+        if len(resized_image.shape) == 3:
+            resized_image = resized_image.permute(2, 0, 1)
+        else:
+            resized_image = resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                      FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                      image=resized_image, gt_alpha_mask=None,
+                      image_name=cam_info.image_name, uid=cam_info.uid, data_device=self.args.data_device, fid=cam_info.fid)        
+
+    def __len__(self):
+        return len(self.cams)
+
+
+class FlowDataset(torch.utils.data.Dataset):
+    def __init__(self, cams, args):
+        self.cams = cams
+        self.args = args
+
+    def __getitem__(self, index):
+        cam_info = self.cams[index]
+        # image = cam_info.image
+        image = Image.open(cam_info.image_path)
+        data_root = '/'.join(cam_info.image_path.split('/')[:-2])
+        folder = cam_info.image_path.split('/')[-2]
+        image_name =  cam_info.image_path.split('/')[-1]
+        fwd_flow_path = os.path.join(data_root, f'{folder}_flow', f'{os.path.splitext(image_name)[0]}_fwd.npz')
+        bwd_flow_path = os.path.join(data_root, f'{folder}_flow', f'{os.path.splitext(image_name)[0]}_bwd.npz')
+        normal_path = os.path.join(data_root, f'normals_from_pretrain', f'{os.path.splitext(image_name)[0]}.png')
+        normal_map = np.array(Image.open(normal_path), dtype="uint8")[..., :3]
+        normal_map = torch.from_numpy(normal_map.astype("float32") / 255.0).float()
+        depth_path = os.path.join(data_root, f'1x_depth', f'{os.path.splitext(image_name)[0]}_depth.png')
+        depth_map = np.array(Image.open(depth_path), dtype="uint8")[..., :1]
+        depth_map = torch.from_numpy(depth_map.astype("float32")/255).float()
+        if os.path.exists(fwd_flow_path):
+            fwd_data = np.load(fwd_flow_path)
+            fwd_flow = torch.from_numpy(fwd_data['flow'])
+            fwd_flow_mask = torch.from_numpy(fwd_data['mask'])
+        else:
+            fwd_flow, fwd_flow_mask  = None, None
+        if os.path.exists(bwd_flow_path):
+            bwd_data = np.load(bwd_flow_path)
+            bwd_flow = torch.from_numpy(bwd_data['flow'])
+            bwd_flow_mask = torch.from_numpy(bwd_data['mask'])
+        else:
+            bwd_flow, bwd_flow_mask  = None, None
+        
+        # image = np.zeros((3, 128, 128))
+        resized_image = torch.from_numpy(np.array(image)) / 255.0
+
+        if len(resized_image.shape) == 3:
+            resized_image = resized_image.permute(2, 0, 1)
+        else:
+            resized_image = resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                      FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                      image=resized_image, gt_alpha_mask=None,
+                      image_name=cam_info.image_name, uid=cam_info.uid,
+                      data_device=self.args.data_device, fid=cam_info.fid,
+                      fwd_flow=fwd_flow, fwd_flow_mask=fwd_flow_mask,
+                      bwd_flow=bwd_flow, bwd_flow_mask=bwd_flow_mask, depth_map= depth_map, normal_map=normal_map)
+    def __len__(self):
+        return len(self.cams)
 
 
 class Scene:
@@ -41,6 +121,7 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.use_loader = False
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
@@ -53,6 +134,7 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "dataset.json")):
             print("Found dataset.json file, assuming Nerfies data set!")
             scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval)
+            self.use_loader = True
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             print("Found calibration_full.json, assuming Neu3D data set!")
             scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
@@ -77,19 +159,23 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
 
-        if shuffle:
-            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
-            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+        if not self.use_loader:
+            if shuffle:
+                random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
+                random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        
+        if self.use_loader:
+            self.train_cameras[resolution_scales[0]] = FlowDataset(scene_info.train_cameras, args)
+            self.test_cameras[resolution_scales[0]] = FlowDataset(scene_info.test_cameras, args)
 
-        for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
-                                                                            args)
-            print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
-                                                                           args)
+        else:
+            for resolution_scale in resolution_scales:
+                print("Loading Training Cameras")
+                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+                print("Loading Test Cameras")
+                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,

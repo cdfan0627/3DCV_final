@@ -214,3 +214,37 @@ def length(x: torch.Tensor, eps: float =1e-20) -> torch.Tensor:
 
 def safe_normalize(x: torch.Tensor, eps: float =1e-20) -> torch.Tensor:
     return x / length(x, eps)
+
+
+def rotation_matrix_from_vectors(vecs1, vecs2):
+    """ Find the rotation matrix that aligns each pair of vectors in vecs1 to vecs2, with special handling for parallel vectors. """
+    # Normalize the vectors
+    a = vecs1 / vecs1.norm(dim=1, keepdim=True)
+    b = vecs2 / vecs2.norm(dim=1, keepdim=True)
+    
+    # Cross product and dot product
+    v = torch.cross(a, b, dim=1)
+    c = torch.sum(a * b, dim=1)
+    
+    # Check if vectors are parallel (c = ±1)
+    parallel = torch.isclose(torch.abs(c), torch.tensor(1.0))
+    same_direction = c > 0
+    
+    # Compute the skew-symmetric cross-product matrix for each pair of vectors
+    kmat = torch.zeros((v.size(0), 3, 3), device=vecs1.device)
+    kmat[:, 0, 1] = -v[:, 2]
+    kmat[:, 1, 0] = v[:, 2]
+    kmat[:, 0, 2] = v[:, 1]
+    kmat[:, 2, 0] = -v[:, 1]
+    kmat[:, 1, 2] = -v[:, 0]
+    kmat[:, 2, 1] = v[:, 0]
+    
+    # Rodrigues' formula for rotation matrix
+    I = torch.eye(3, device=vecs1.device).unsqueeze(0).repeat(v.size(0), 1, 1)
+    rotation_matrix = I + kmat + torch.bmm(kmat, kmat) * (1 - c).unsqueeze(-1).unsqueeze(-1) / (v.norm(dim=1, keepdim=True) ** 2 + 1e-6).unsqueeze(-1)
+    
+    # Handle parallel vectors
+    rotation_matrix[parallel & same_direction] = torch.eye(3, device=vecs1.device)
+    rotation_matrix[parallel & ~same_direction] = -torch.eye(3, device=vecs1.device)
+    
+    return rotation_matrix
