@@ -14,3 +14,18 @@ We organize the datasets as follows:
 │     ├── press
 │     ├── sieve
 ```
+
+## Environment Setup
+```shell
+git clone https://github.com/ingra14m/Deformable-3D-Gaussians --recursive
+cd 
+
+conda create -n DS3DGS python=3.8
+conda activate DS3DGS
+
+# install pytorch
+pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
+
+# install dependencies
+pip install -r requirements.txt
+```
