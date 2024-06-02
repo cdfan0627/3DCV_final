@@ -17,8 +17,8 @@ We organize the datasets as follows:
 
 ## Environment Setup
 ```shell
-git clone https://github.com/ingra14m/Deformable-3D-Gaussians --recursive
-cd 
+git clone https://github.com/cdfan0627/3DCV_final.git --recursive
+cd 3DCV_final
 
 conda create -n DS3DGS python=3.8
 conda activate DS3DGS
