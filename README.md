@@ -30,7 +30,7 @@ pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url http
 pip install -r requirements.txt
 ```
 ## Weight
-Download 
+Download [weights](https://drive.google.com/file/d/1spJFxPqVa72VbsviCAP8w9-Vuzs9c3gM/view?usp=drive_link)
 
 We organize the weights as follows:
 ```shell
