@@ -48,7 +48,7 @@ In every scene you need to change 'source_path' in cfg_args as follows:
 ```shell
 source_path='<path to your dataset>'
 
-For example
+# For example
 source_path='/home/fansa/DS3DGS/data/NeRF-DS/as_novel_view'
 ```
 ## Render & Evaluation
