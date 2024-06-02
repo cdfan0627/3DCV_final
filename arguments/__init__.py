@@ -90,13 +90,12 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.diffuse_lr = 0.0025
         self.opacity_lr = 0.05
-        self.normal_lr = 0.2
+        self.normal_lr = 0.02
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.lambda_flow = 0.01
-        self.lambda_reg = 0.001
+        self.lambda_reg = 0.01
         self.lambda_depth = 0.002
         self.lambda_normal = 0.1
         self.densification_interval = 100

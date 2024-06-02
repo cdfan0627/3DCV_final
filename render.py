@@ -24,7 +24,6 @@ from arguments import ModelParams, PipelineParams, get_combined_args, Optimizati
 from gaussian_renderer import GaussianModel
 import imageio
 import numpy as np
-import flow_viz
 from PIL import Image
 
 
@@ -32,33 +31,27 @@ from PIL import Image
 def render_set(model_path, opt, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, deform, specdecoder):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
-    diffuse_path = os.path.join(model_path, name, "ours_{}".format(iteration), "diffuse")
-    specular_path = os.path.join(model_path, name, "ours_{}".format(iteration), "specular")
-    normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normal")
-    flow_path = os.path.join(model_path, name, "ours_{}".format(iteration), "flow")
+    # depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
+    # diffuse_path = os.path.join(model_path, name, "ours_{}".format(iteration), "diffuse")
+    # specular_path = os.path.join(model_path, name, "ours_{}".format(iteration), "specular")
+    # specular_tint_path = os.path.join(model_path, name, "ours_{}".format(iteration), "specular_tint")
+    # new_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "new_normal")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
-    makedirs(diffuse_path, exist_ok=True)
-    makedirs(specular_path, exist_ok=True)
-    makedirs(normal_path, exist_ok=True)
-    makedirs(flow_path, exist_ok=True)
+    # makedirs(depth_path, exist_ok=True)
+    # makedirs(diffuse_path, exist_ok=True)
+    # makedirs(specular_path, exist_ok=True)
+    # makedirs(specular_tint_path, exist_ok=True)
+    # makedirs(new_normal_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if idx == 0:
-            view1 = view
-            continue
         if load2gpu_on_the_fly:
             view.load2device()
-        fid1 = view1.fid
-        fid2 = view.fid
+        fid = view.fid
         xyz = gaussians.get_xyz
-        time_input1 = fid1.unsqueeze(0).expand(xyz.shape[0], -1)
-        time_input2 = fid2.unsqueeze(0).expand(xyz.shape[0], -1)
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input1)
-        d_xyz2, d_rotation2, d_scaling2 = deform.step(xyz.detach(), time_input2)
+        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
         view_pos = view.camera_center.repeat(gaussians.get_opacity.shape[0], 1)
         wo = safe_normalize(view_pos - gaussians.get_xyz.detach())
         dir_pp_normalized = -wo
@@ -67,53 +60,29 @@ def render_set(model_path, opt, load2gpu_on_the_fly, is_6dof, name, iteration, v
         deform_dir_pp_normalized = -deform_wo
         deform_normal = gaussians.get_deformnormal(d_rotation, d_scaling, dir_pp_normalized=deform_dir_pp_normalized)
         rotation_matrix = rotation_matrix_from_vectors(normal, deform_normal)
-        deform_deltanormal = torch.matmul(rotation_matrix, gaussians.get_delta_normal.unsqueeze(-1))
-        new_normal = safe_normalize(deform_normal + deform_deltanormal.squeeze(-1))
+        deform_deltanormal = torch.matmul(rotation_matrix, gaussians.get_delta_normal.unsqueeze(-1)).squeeze(-1)
+        #norm_deform_deltanormal = safe_normalize(deform_deltanormal)
+        new_normal = safe_normalize(deform_normal + deform_deltanormal)
         reflvec = safe_normalize(reflect(deform_wo, new_normal))
-        spat = torch.cat([gaussians.get_xyz.detach() + d_xyz.detach(), gaussians.get_roughness * (gaussians.get_scaling.detach() + d_scaling.detach()), gaussians.get_rotation.detach() + d_rotation.detach()], dim=-1)
+        spat = torch.cat([gaussians.get_xyz.detach() + d_xyz.detach(), gaussians.get_roughness * torch.abs(gaussians.get_scaling.detach() + d_scaling.detach()), gaussians.get_rotation.detach() + d_rotation.detach()], dim=-1)
         spec_color = specdecoder.step(spat, reflvec)
         results = render(view, gaussians, opt, pipeline, background, d_xyz, d_rotation, d_scaling, spec_color, new_normal, iteration, is_6dof)
-        # rendering = results["render"]
+        rendering = results["render"]
         # depth = results["depth"]
         # diffuse = results["diffuse"]
         # specular = results["specular_color"]
-        # normal = results["normal"]
-        #print(rendering.shape)
-        # depth = depth / (depth.max() + 1e-5)
-        # Gaussian flow
-        render_t_1 = render(view, gaussians, opt, pipeline, background, d_xyz, d_rotation, d_scaling, spec_color, new_normal, iteration, is_6dof)
-        render_t_2 = render(view, gaussians, opt, pipeline, background, d_xyz2, d_rotation2, d_scaling2, spec_color, new_normal, iteration, is_6dof)
-            # Gaussian parameters at t_1
-        proj_2D_t_1 = render_t_1["proj_2D"]
-        gs_per_pixel = render_t_1["gs_per_pixel"].long() 
-        weight_per_gs_pixel = render_t_1["weight_per_gs_pixel"]
-        x_mu = render_t_1["x_mu"]
-        cov2D_inv_t_1 = render_t_1["conic_2D"].detach()
-                # Gaussian parameters at t_2
-        proj_2D_t_2 = render_t_2["proj_2D"]
-        cov2D_inv_t_2 = render_t_2["conic_2D"]
-        cov2D_t_2 = render_t_2["conic_2D_inv"]
-                # calculate cov2D_t_2*cov2D_inv_t_1
-        cov2D_t_2cov2D_inv_t_1 = torch.zeros([cov2D_inv_t_2.shape[0],2,2]).cuda()
-        cov2D_t_2cov2D_inv_t_1[:, 0, 0] = cov2D_t_2[:, 0] * cov2D_inv_t_1[:, 0] + cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 1]
-        cov2D_t_2cov2D_inv_t_1[:, 0, 1] = cov2D_t_2[:, 0] * cov2D_inv_t_1[:, 1] + cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 2]
-        cov2D_t_2cov2D_inv_t_1[:, 1, 0] = cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 0] + cov2D_t_2[:, 2] * cov2D_inv_t_1[:, 1]
-        cov2D_t_2cov2D_inv_t_1[:, 1, 1] = cov2D_t_2[:, 1] * cov2D_inv_t_1[:, 1] + cov2D_t_2[:, 2] * cov2D_inv_t_1[:, 2]
-
-                # full formulation of GaussianFlow
-        cov_multi = (cov2D_t_2cov2D_inv_t_1[gs_per_pixel] @ x_mu.permute(0,2,3,1).unsqueeze(-1).detach()).squeeze()
-
-        predicted_flow_by_gs = (cov_multi + proj_2D_t_2[gs_per_pixel] - proj_2D_t_1[gs_per_pixel].detach() - x_mu.permute(0,2,3,1).detach()) * weight_per_gs_pixel.unsqueeze(-1).detach()
+        # specular_tint = results["specular_tint"]
+        #new_render_normal = results["new_normal"]
 
         gt = view.original_image[0:3, :, :]
-        # torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         # torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
         # torchvision.utils.save_image(diffuse, os.path.join(diffuse_path, '{0:05d}'.format(idx) + ".png"))
         # torchvision.utils.save_image(specular, os.path.join(specular_path, '{0:05d}'.format(idx) + ".png"))
-        # torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
-        Image.fromarray(flow_viz.flow_to_image(predicted_flow_by_gs.sum(0).cpu().numpy())).save(os.path.join(flow_path, '{0:05d}'.format(idx) + ".png"))
-        view1 = view
+        # torchvision.utils.save_image(specular_tint, os.path.join(specular_tint_path, '{0:05d}'.format(idx) + ".png"))
+        #torchvision.utils.save_image(new_render_normal, os.path.join(new_normal_path, '{0:05d}'.format(idx) + ".png"))
+
 
 
 def render_sets(dataset: ModelParams, opt: OptimizationParams, iteration: int, pipeline: PipelineParams, skip_train: bool, skip_test: bool,

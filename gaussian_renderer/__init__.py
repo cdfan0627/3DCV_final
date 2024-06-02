@@ -30,7 +30,7 @@ def quaternion_multiply(q1, q2):
     return torch.stack((w, x, y, z), dim=-1)
 
 
-def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling,  spec_color, normal, iteration, is_6dof=False, 
+def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling,  spec_color, new_normal, iteration, is_6dof=False, 
            scaling_modifier=1.0, override_color=None):
     """
     Render the scene. 
@@ -85,7 +85,7 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling + d_scaling
+        scales = torch.abs(pc.get_scaling + d_scaling)
         rotations = pc.get_rotation + d_rotation
 
 
@@ -116,7 +116,7 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, rendered_depth, rendered_alpha, proj_means_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer(
+    rendered_image, radii, rendered_depth = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -129,22 +129,31 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
     out_extras = {}
     
     if iteration >= opt.warm_up2:
-        normal_normed = 0.5*normal + 0.5
-        render_extras.update({"normal": normal_normed,
-                            "diffuse": diffuse_linear,
-                            "specular_color": specular_color,
+        # p_hom = torch.cat([pc.get_xyz, torch.ones_like(pc.get_xyz[...,:1])], -1).unsqueeze(-1)
+        # p_view = torch.matmul(viewpoint_camera.world_view_transform.transpose(0,1), p_hom)
+        # p_view = p_view[...,:3,:]
+        # depth = p_view.squeeze()[...,2:3]
+        # depth = depth.repeat(1,3)
+
+        new_normal_normed = 0.5*new_normal + 0.5
+        render_extras.update({
+                            "normal": new_normal_normed,
+                            # "diffuse": diffuse_linear,
+                            # "specular_color": spec_color,
+                            # "specular_tint": specular,
+                            # "shader depth": depth
                             })
         
         for k in render_extras.keys():
                 if render_extras[k] is None: continue
                 image = rasterizer(
-                    means3D = means3D,
-                    means2D = means2D,
+                    means3D = means3D.detach(),
+                    means2D = means2D.detach(),
                     shs = None,
                     colors_precomp = render_extras[k],
-                    opacities = opacity,
-                    scales = scales,
-                    rotations = rotations,
+                    opacities = opacity.detach(),
+                    scales = scales.detach(),
+                    rotations = rotations.detach(),
                     cov3D_precomp = cov3D_precomp)[0]
                 out_extras[k] = image
         # for k in["normal"]:
@@ -158,12 +167,14 @@ def render(viewpoint_camera, pc: GaussianModel, opt, pipe, bg_color: torch.Tenso
             "visibility_filter": radii > 0,
             "radii": radii,
             "depth": rendered_depth,
-            "alpha": rendered_alpha,
-            "proj_2D": proj_means_2D,
-            "conic_2D": conic_2D,
-            "conic_2D_inv": conic_2D_inv,
-            "gs_per_pixel": gs_per_pixel,
-            "weight_per_gs_pixel": weight_per_gs_pixel,
-            "x_mu": x_mu}
+            # "alpha": rendered_alpha,
+            # "proj_2D": proj_means_2D,
+            # "conic_2D": conic_2D,
+            # "conic_2D_inv": conic_2D_inv,
+            # "gs_per_pixel": gs_per_pixel,
+            # "weight_per_gs_pixel": weight_per_gs_pixel,
+            # "x_mu": x_mu
+            }
     out.update(out_extras)
     return out
+

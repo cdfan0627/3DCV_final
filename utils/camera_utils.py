@@ -9,7 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+import torch
 from scene.cameras import Camera
+from PIL import Image
 import numpy as np
 from utils.general_utils import PILtoTorch, ArrayToTorch
 from utils.graphics_utils import fov2focal
@@ -20,7 +23,14 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
-
+    data_root = '/'.join(cam_info.image_path.split('/')[:-2])
+    image_name =  cam_info.image_path.split('/')[-1]
+    # normal_path = os.path.join(data_root, f'normals_from_pretrain', f'{os.path.splitext(image_name)[0]}.png')
+    # normal_map = np.array(Image.open(normal_path), dtype="uint8")[..., :3]
+    # normal_map = torch.from_numpy(normal_map.astype("float32") / 255.0).float()
+    # depth_path = os.path.join(data_root, f'1x_depth', f'{os.path.splitext(image_name)[0]}_depth.png')
+    # depth_map = np.array(Image.open(depth_path), dtype="uint8")[..., :1]
+    # depth_map = torch.from_numpy(depth_map.astype("float32") / 255.0).float()
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w / (resolution_scale * args.resolution)), round(
             orig_h / (resolution_scale * args.resolution))

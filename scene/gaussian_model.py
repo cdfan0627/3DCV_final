@@ -95,7 +95,7 @@ class GaussianModel:
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def get_deformnormal(self, d_rotation, d_scaling, dir_pp_normalized=None):
-        normal_axis = get_minimum_axis(self.get_scaling.detach() + d_scaling.detach(), self.get_rotation.detach() + d_rotation.detach())
+        normal_axis = get_minimum_axis(torch.abs(self.get_scaling.detach() + d_scaling.detach()), self.get_rotation.detach() + d_rotation.detach())
         normal_axis = flip_align_view(normal_axis, dir_pp_normalized)
         normal = normal_axis
         #normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
