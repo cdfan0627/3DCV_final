@@ -6,13 +6,13 @@ We organize the datasets as follows:
 ```shell
 ├── data
 │   | NeRF-DS
-│     ├── as
-│     ├── basin
-│     ├── bell
-│     ├── cup
-│     ├── plate
-│     ├── press
-│     ├── sieve
+│     ├── as_novel_view
+│     ├── basin_novel_view
+│     ├── bell_novel_view
+│     ├── cup_novel_view
+│     ├── plate_novel_view
+│     ├── press_novel_view
+│     ├── sieve_novel_view
 ```
 
 ## Environment Setup
@@ -28,6 +28,28 @@ pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url http
 
 # install dependencies
 pip install -r requirements.txt
+```
+## Weight
+Download 
+
+We organize the weights as follows:
+```shell
+├── output
+│   | NeRF-DS
+│     ├── as_novel_view
+│     ├── basin_novel_view
+│     ├── bell_novel_view
+│     ├── cup_novel_view
+│     ├── plate_novel_view
+│     ├── press_novel_view
+│     ├── sieve_novel_view
+```
+In every scene you need to change 'source_path' in cfg_args as follows:
+```shell
+source_path='<path to your dataset>'
+
+For example
+source_path='/home/fansa/DS3DGS/data/NeRF-DS/as_novel_view'
 ```
 ## Render & Evaluation
 ```shell
